@@ -17,6 +17,10 @@ const (
 	resultNoBody       = "replay_without_body"
 )
 
+// unknownModelLabel stands in for model names that are not in the decisions
+// table: those come from clients and would make metric names unbounded.
+const unknownModelLabel = "unknown"
+
 // Fallback reasons.
 const (
 	reasonNoCandidate     = "no_candidate"

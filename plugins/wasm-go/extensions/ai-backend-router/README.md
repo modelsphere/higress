@@ -199,7 +199,7 @@ spec:
 |---|---|
 | `ai_backend_router.model.<m>.backend.<b>.tier.<t>.picks_total` | Passes routed to a backend (including spilled ones) |
 | `ai_backend_router.model.<m>.backend.<b>.status.<s>.spills_total` | Passes that spilled, by backend and status |
-| `ai_backend_router.model.<m>.result.<r>.requests_total` | Client requests by result: `served`, `exhausted`, `fallback`, `unknown_model`, `invalid_request`, `replay_without_body` |
+| `ai_backend_router.model.<m>.result.<r>.requests_total` | Client requests, counted once on their final pass, by result: `served` (the final pass was routed by tier and did not spill, whatever its status), `exhausted` (a retriable error with no tier left), `fallback` (routed to the default backend), `unknown_model`, `invalid_request`, `replay_without_body`. Model names not in the decisions table are counted as `unknown`. |
 | `ai_backend_router.reason.<reason>.fallback_total` | Default-backend routing and other fallbacks |
 | `ai_backend_router.decision_pull_failures_total` | Failed decision pulls |
 | `ai_backend_router.decisions_age_ms` | Time since the last successful pull |
@@ -215,5 +215,8 @@ spec:
 - **Every pass runs the whole filter chain.** Filters before this plugin run once per pass: authentication, `ai-proxy` conversion, and **request-count rate limiters, which count every spilled pass** (a request that spills once uses two tokens). `ai-statistics` also records each pass.
 - Only answers before any response byte can spill. A stream that fails midway reaches the client.
 - A request whose body exceeds the `buffer` filter limit is rejected with 413 rather than served without the ability to spill.
+- `max_internal_redirects` (16 in the example) caps the passes: a model with more tiers than that cannot reach the extra ones, and when the cap is hit `custom_response` passes the marked response to the client as is.
+- The plugin removes any `x-higress-spill` header sent by the upstream, so only the plugin can trigger a replay.
+- **Replay target.** The replay goes to `x-envoy-original-path` / `x-envoy-original-host`. Envoy strips client-supplied copies only for edge requests; requests from internal addresses keep them, and `ai-proxy` (when it runs before this plugin) removes them itself. Without `ai-proxy`, a client on an internal address could make its spilled request replay on another route of the gateway. That route runs its own authentication, so this grants no access the client lacks, but remove both headers from client requests where the gateway is not the edge (for example in the load balancer in front of it).
 - If the state property cannot be declared with the request lifespan, the plugin logs an error at start and routes without spillover.
 - Requests without a body (for example `GET /v1/models`) and non-JSON requests are not routed: they pass through with their path unchanged.

@@ -43,6 +43,10 @@ func parseConfig(json gjson.Result, config *Config) error {
 	if !json.IsObject() {
 		return fmt.Errorf("config must be an object")
 	}
+	// Keys starting with "_" belong to the wrapper (rules, match conditions).
+	if err := onlyKeys(json, "config", true, "retry", "limits", "decisions"); err != nil {
+		return err
+	}
 	if err := parseRetry(json.Get("retry"), config); err != nil {
 		return err
 	}
@@ -51,6 +55,9 @@ func parseConfig(json gjson.Result, config *Config) error {
 	if limits := json.Get("limits"); limits.Exists() {
 		if !limits.IsObject() {
 			return fmt.Errorf("limits must be an object")
+		}
+		if err := onlyKeys(limits, "limits", false, "maxRequestBodyBytes"); err != nil {
+			return err
 		}
 		if value := limits.Get("maxRequestBodyBytes"); value.Exists() {
 			n, ok := intIn(value, 1, maxRequestBodyBytesLimit)
@@ -64,6 +71,9 @@ func parseConfig(json gjson.Result, config *Config) error {
 	decisionsJSON := json.Get("decisions")
 	if !decisionsJSON.IsObject() {
 		return fmt.Errorf("decisions must be an object")
+	}
+	if err := onlyKeys(decisionsJSON, "decisions", false, "static", "source"); err != nil {
+		return err
 	}
 	staticJSON := decisionsJSON.Get("static")
 	if !staticJSON.Exists() {
@@ -112,6 +122,9 @@ func parseRetry(retry gjson.Result, config *Config) error {
 	if !retry.IsObject() {
 		return fmt.Errorf("retry must be an object")
 	}
+	if err := onlyKeys(retry, "retry", false, "codes", "exclude", "maxAttempts"); err != nil {
+		return err
+	}
 	if codes := retry.Get("codes"); codes.Exists() {
 		if !codes.IsArray() || len(codes.Array()) == 0 {
 			return fmt.Errorf("retry.codes must be a non-empty array of HTTP status codes")
@@ -143,6 +156,9 @@ func parseRetry(retry gjson.Result, config *Config) error {
 func parseSource(json gjson.Result) (*sourceConfig, error) {
 	if !json.IsObject() {
 		return nil, fmt.Errorf("decisions.source must be an object")
+	}
+	if err := onlyKeys(json, "decisions.source", false, "serviceName", "servicePort", "host", "path", "intervalMs", "timeoutMs", "maxStaleMs"); err != nil {
+		return nil, err
 	}
 	source := &sourceConfig{
 		intervalMs: defaultPullIntervalMs,
@@ -185,6 +201,25 @@ func parseSource(json gjson.Result) (*sourceConfig, error) {
 		source.maxStaleMs = n
 	}
 	return source, nil
+}
+
+// onlyKeys rejects unknown keys, so a typo cannot silently disable a feature.
+func onlyKeys(object gjson.Result, where string, allowUnderscore bool, allowed ...string) error {
+	var err error
+	object.ForEach(func(key, _ gjson.Result) bool {
+		name := key.String()
+		if allowUnderscore && strings.HasPrefix(name, "_") {
+			return true
+		}
+		for _, candidate := range allowed {
+			if name == candidate {
+				return true
+			}
+		}
+		err = fmt.Errorf("%s: unknown field %q", where, name)
+		return false
+	})
+	return err
 }
 
 func intIn(value gjson.Result, lo, hi int64) (int64, bool) {

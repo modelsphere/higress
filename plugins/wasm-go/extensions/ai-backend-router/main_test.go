@@ -343,6 +343,11 @@ func TestRejectsInvalidConfig(t *testing.T) {
 		"source bad port":       `{"decisions":{"static":` + staticTable + `,"source":{"serviceName":"d.example.com","servicePort":0,"path":"/d"}}}`,
 		"source bad path":       `{"decisions":{"static":` + staticTable + `,"source":{"serviceName":"d.example.com","servicePort":80,"path":"d"}}}`,
 		"source short interval": `{"decisions":{"static":` + staticTable + `,"source":{"serviceName":"d.example.com","servicePort":80,"path":"/d","intervalMs":10}}}`,
+		"unknown top field":     `{"retires":{},"decisions":{"static":` + staticTable + `}}`,
+		"unknown retry field":   `{"retry":{"code":[429]},"decisions":{"static":` + staticTable + `}}`,
+		"unknown limits field":  `{"limits":{"maxBodyBytes":1},"decisions":{"static":` + staticTable + `}}`,
+		"unknown decisions key": `{"decisions":{"static":` + staticTable + `,"sources":{}}}`,
+		"unknown source field":  `{"decisions":{"static":` + staticTable + `,"source":{"serviceName":"d.example.com","servicePort":80,"path":"/d","interval":5000}}}`,
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -439,5 +444,60 @@ func TestPullHonoursIntervalAndETag(t *testing.T) {
 		require.Equal(t, uint64(0), counter(t, host, "ai_backend_router.decision_pull_failures_total"), "304 keeps the table and is not a failure")
 		pass(t, host, chatBody)
 		require.Equal(t, "new", backendOf(host))
+	})
+}
+
+func TestAcceptsWrapperKeys(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		config := json.RawMessage(`{"decisions":{"static":` + staticTable + `},"_rules_":[{"_match_route_":["r1"],"decisions":{"static":` + staticTable + `}}]}`)
+		host := newHost(t, config)
+		defer host.Reset()
+	})
+}
+
+func TestUpstreamSpillMarkerIsRemoved(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		// A routed pass: the backend answers 200 with the marker.
+		host := newHost(t, pluginConfig(""))
+		defer host.Reset()
+		pass(t, host, chatBody)
+		require.NoError(t, host.SetProperty([]string{"response", "code_details"}, []byte("via_upstream")))
+		host.CallOnHttpResponseHeaders([][2]string{{":status", "200"}, {spillHeader, "1"}})
+		require.False(t, test.HasHeader(host.GetResponseHeaders(), spillHeader), "only the plugin may ask for a redirect")
+	})
+	test.RunTest(t, func(t *testing.T) {
+		// A pass the plugin did not route (no body).
+		host := newHost(t, pluginConfig(""))
+		defer host.Reset()
+		host.CallOnHttpRequestHeaders([][2]string{{":authority", "gw.example.com"}, {":method", "GET"}, {":path", "/v1/models"}}, test.WithEndOfStream(true))
+		host.CallOnHttpResponseHeaders([][2]string{{":status", "429"}, {spillHeader, "1"}})
+		require.False(t, test.HasHeader(host.GetResponseHeaders(), spillHeader))
+	})
+}
+
+func TestUnknownModelMetricHasAFixedLabel(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		host := newHost(t, pluginConfig(""))
+		defer host.Reset()
+		for _, name := range []string{"gpt-x", "attacker-chosen-name"} {
+			pass(t, host, `{"model":"`+name+`"}`)
+			host.CompleteHttp()
+		}
+		require.Equal(t, uint64(2), counter(t, host, "ai_backend_router.model.unknown.result.unknown_model.requests_total"))
+		_, err := host.GetCounterMetric("ai_backend_router.model.gpt-x.result.unknown_model.requests_total")
+		require.Error(t, err, "client-supplied model names must not become metric names")
+	})
+}
+
+func TestReplayWithoutBodyEvenWithUnreadableState(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host := newHost(t, pluginConfig(""))
+		defer host.Reset()
+		require.NoError(t, host.SetProperty([]string{stateProperty}, []byte("{not json")))
+		action := host.CallOnHttpRequestHeaders(requestHeaders("/v1/chat/completions"), test.WithEndOfStream(true))
+		require.Equal(t, types.ActionPause, action)
+		local := host.GetLocalResponse()
+		require.NotNil(t, local)
+		require.Equal(t, uint32(502), local.StatusCode)
 	})
 }

@@ -76,9 +76,11 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 	// The plugin rewrites :path; it must not move the request to another route.
 	ctx.DisableReroute()
 
-	state, found, err := loadState()
+	state, found, _ := loadState()
 	if !ctx.HasRequestBody() {
-		if found && err == nil {
+		// Any state means this is a replayed pass, even if the state cannot be
+		// decoded; state is only written for requests that had a body.
+		if found {
 			// A replayed pass must carry the original body (custom_response
 			// use_original_request_body + the buffer filter). Never send a
 			// body-less POST upstream.
@@ -124,7 +126,8 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	snapshot := config.store.snapshot()
 	model := snapshot.Model(modelField.String())
 	if model == nil {
-		config.metrics.request(modelField.String(), resultUnknownModel)
+		// The name comes from the client: never put it in a metric name.
+		config.metrics.request(unknownModelLabel, resultUnknownModel)
 		replyError(http.StatusNotFound, "model_not_found", "model \""+modelField.String()+"\" is not served by this gateway")
 		return types.ActionPause
 	}
@@ -208,6 +211,12 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 }
 
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config Config) types.Action {
+	// custom_response redirects on the marker alone, so only this plugin may
+	// set it: drop any copy that came from upstream, on every response.
+	if marker, err := proxywasm.GetHttpResponseHeader(spillHeader); err == nil && marker != "" {
+		_ = proxywasm.RemoveHttpResponseHeader(spillHeader)
+		config.log.errorf("upstream_marker", "[ai-backend-router] removed a %s header sent by the upstream", spillHeader)
+	}
 	p, _ := ctx.GetContext(pickContextKey).(*pick)
 	if p == nil {
 		return types.ActionContinue
