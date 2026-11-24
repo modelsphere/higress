@@ -1,0 +1,266 @@
+# Publish one Higress wasm plugin (Go, C++ or Rust) as a container image.
+#
+# Trigger: push a tag  plugin/<lang>/<name>/v<version>
+#   plugin/go/ai-backend-router/v1.0.0  ->  docker.io/4pdosc/higress-plugin-ai-backend-router:1.0.0
+#   plugin/cpp/key_auth/v1.0.1          ->  docker.io/4pdosc/higress-plugin-key-auth:1.0.1
+# <lang> is go | cpp | rust, <name> is the directory under plugins/wasm-<lang>/extensions/,
+# and <version> (without the v) must equal that directory's VERSION file, so a tag can only
+# publish what the commit says it is. The image tag carries no v, like upstream's plugin
+# images and the VERSION file.
+#
+# A tag runs the workflow file as it exists in the TAGGED commit, so tag a commit that
+# already contains this file. Tags under plugin/ match none of the upstream workflows'
+# tag filters (v*.*.*, wasm-*-*-v*.*.*).
+#
+# Manual runs (workflow_dispatch) build and test only and never push: a dry run.
+#
+# Build: upstream's own per-language Dockerfile (plugins/wasm-<lang>/Dockerfile), built to
+# its "output" stage and exported as a file, so the wasm is compiled exactly the way
+# upstream compiles it. Packaging is separate: FROM scratch + that single plugin.wasm,
+# which lets the pushed layer be checked byte-for-byte against the build.
+#
+# A published version is never overwritten: the run fails if <image>:<version> already
+# exists, so bump VERSION instead. No :latest tag either -- a WasmPlugin should name an
+# exact version (with the default imagePullPolicy a gateway may keep serving a cached copy
+# of a re-pushed tag).
+# Provenance/SBOM attestations are off: they turn the push into a multi-manifest index,
+# and a single plain manifest is the shape that has been verified to load.
+#
+# Gateways in mainland China may not reach Docker Hub. Every 4pdosc image is mirrored to
+# modelsphere.tencentcloudcr.com/4pdosc within about ten minutes; WasmPlugins there
+# reference the mirror (printed in the run summary).
+name: Release plugin image
+
+on:
+  push:
+    tags:
+      - 'plugin/*/*/v[0-9]*'
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "Plugin language"
+        required: true
+        type: choice
+        options: [go, cpp, rust]
+      plugin:
+        description: "Directory under plugins/wasm-<language>/extensions/ (dry run: build and test, no push)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plugin-${{ github.ref }}-${{ inputs.language }}-${{ inputs.plugin }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAMESPACE: 4pdosc
+  IMAGE_PREFIX: higress-plugin-
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve language, plugin and version
+        id: meta
+        env:
+          INPUT_LANGUAGE: ${{ inputs.language }}
+          INPUT_PLUGIN: ${{ inputs.plugin }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            ref="$GITHUB_REF_NAME"                       # plugin/<lang>/<name>/v<version>
+            if [[ ! "$ref" =~ ^plugin/(go|cpp|rust)/([a-z0-9][a-z0-9_-]*)/v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+              echo "::error::tag '$ref' is not plugin/<go|cpp|rust>/<name>/v<major.minor.patch[-pre]>"; exit 1
+            fi
+            lang="${BASH_REMATCH[1]}"; name="${BASH_REMATCH[2]}"; version="${BASH_REMATCH[3]}"; push=true
+          else
+            lang="$INPUT_LANGUAGE"; name="$INPUT_PLUGIN"; version=""; push=false
+            if [[ ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+              echo "::error::plugin name '$name' must match [a-z0-9][a-z0-9_-]*"; exit 1
+            fi
+          fi
+          image_name="${IMAGE_PREFIX}${name//_/-}"       # key_auth -> higress-plugin-key-auth
+          {
+            echo "lang=$lang"
+            echo "name=$name"
+            echo "version=$version"
+            echo "push=$push"
+            echo "root=plugins/wasm-$lang"
+            echo "dir=plugins/wasm-$lang/extensions/$name"
+            echo "image_name=$image_name"
+            echo "image=docker.io/${IMAGE_NAMESPACE}/${image_name}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check the plugin directory, its VERSION and name clashes
+        id: version
+        env:
+          LANG_: ${{ steps.meta.outputs.lang }}
+          NAME: ${{ steps.meta.outputs.name }}
+          ROOT: ${{ steps.meta.outputs.root }}
+          DIR: ${{ steps.meta.outputs.dir }}
+          TAG_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -d "$DIR" ] || { echo "::error::$DIR not found"; exit 1; }
+          [ -f "$ROOT/Dockerfile" ] || { echo "::error::$ROOT/Dockerfile not found"; exit 1; }
+          [ -f "$DIR/VERSION" ] || { echo "::error::$DIR/VERSION not found"; exit 1; }
+          file_version=$(tr -d ' \t\r\n' < "$DIR/VERSION")
+          if [ -n "$TAG_VERSION" ] && [ "$TAG_VERSION" != "$file_version" ]; then
+            echo "::error::tag version $TAG_VERSION != $DIR/VERSION $file_version"; exit 1
+          fi
+          # The image name drops the language, as upstream's does. Some names exist in two
+          # languages (model-router in Go and C++, ...), so both would land in one
+          # repository; the next step makes sure neither can overwrite the other's tags.
+          dashed="${NAME//_/-}"; underscored="${NAME//-/_}"
+          for other in plugins/wasm-*/extensions/"$dashed" plugins/wasm-*/extensions/"$underscored"; do
+            [ -d "$other" ] || continue
+            [ "$other" = "$DIR" ] && continue
+            echo "::warning::$other maps to the same image name as $DIR"
+          done
+          echo "version=${TAG_VERSION:-$file_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing image tag
+        if: steps.meta.outputs.push == 'true'
+        env:
+          IMAGE_NAME: ${{ steps.meta.outputs.image_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Docker Hub API: 200 = tag exists, 404 = tag or repository absent. Anything else
+          # (rate limit, outage) cannot prove absence, so it fails the run rather than
+          # risk overwriting a published version.
+          url="https://hub.docker.com/v2/namespaces/${IMAGE_NAMESPACE}/repositories/${IMAGE_NAME}/tags/${VERSION}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)
+          case "$code" in
+            404) echo "${IMAGE_NAMESPACE}/${IMAGE_NAME}:${VERSION} not published yet" ;;
+            200) echo "::error::${IMAGE_NAMESPACE}/${IMAGE_NAME}:${VERSION} already exists; bump VERSION instead of overwriting"; exit 1 ;;
+            *)   echo "::error::could not tell whether ${IMAGE_NAME}:${VERSION} exists (HTTP ${code:-none})"; exit 1 ;;
+          esac
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.meta.outputs.lang == 'go'
+        with:
+          go-version-file: ${{ steps.meta.outputs.dir }}/go.mod
+          cache-dependency-path: ${{ steps.meta.outputs.dir }}/go.sum
+
+      - name: Unit tests (Go)
+        if: steps.meta.outputs.lang == 'go'
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ -f prepare.sh ]; then sh ./prepare.sh; fi
+          go test ./...
+
+      - name: Unit tests (Rust, same toolchain image as the Dockerfile)
+        if: steps.meta.outputs.lang == 'rust'
+        env:
+          ROOT: ${{ steps.meta.outputs.root }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          rust_image=$(awk 'toupper($1)=="FROM" {print $2; exit}' "$ROOT/Dockerfile")
+          docker run --rm -v "$GITHUB_WORKSPACE/$ROOT:/workspace" -w "/workspace/extensions/$NAME" \
+            "$rust_image" sh -c 'if [ -f .prebuild ]; then sh .prebuild; fi; cargo test --lib'
+
+      - name: Unit tests (C++)
+        if: steps.meta.outputs.lang == 'cpp'
+        run: echo "::notice::no unit-test entry point for C++ plugins upstream; build only"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build plugin.wasm with upstream's Dockerfile
+        id: build
+        env:
+          ROOT: ${{ steps.meta.outputs.root }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          docker buildx build "$ROOT" -f "$ROOT/Dockerfile" --target output \
+            --build-arg PLUGIN_NAME="$NAME" --build-arg PLUGIN_ROOT=extensions \
+            --output "type=local,dest=$out"
+          [ -f "$out/plugin.wasm" ] || { echo "::error::build produced no plugin.wasm"; ls -la "$out"; exit 1; }
+          # a wasm module starts with \0asm
+          [ "$(head -c 4 "$out/plugin.wasm" | od -An -tx1 | tr -d ' \n')" = "0061736d" ] \
+            || { echo "::error::build output is not a wasm module"; exit 1; }
+          ctx="$RUNNER_TEMP/image"
+          mkdir -p "$ctx"
+          cp "$out/plugin.wasm" "$ctx/plugin.wasm"
+          printf 'FROM scratch\nCOPY plugin.wasm plugin.wasm\n' > "$ctx/Dockerfile"
+          sha=$(sha256sum "$ctx/plugin.wasm" | cut -d' ' -f1)
+          echo "context=$ctx" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "plugin.wasm: $(stat -c %s "$ctx/plugin.wasm") bytes, sha256 $sha"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: steps.meta.outputs.push == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.meta.outputs.push == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ steps.build.outputs.context }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.version.outputs.version }}
+
+      - name: Verify what the registry serves
+        if: steps.meta.outputs.push == 'true'
+        env:
+          REF: ${{ steps.meta.outputs.image }}:${{ steps.version.outputs.version }}
+          WANT: ${{ steps.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          raw=$(docker buildx imagetools inspect --raw "$REF")
+          echo "$raw" | python3 -c '
+          import json, sys
+          m = json.load(sys.stdin)
+          mt = m.get("mediaType", "")
+          if "index" in mt or "manifest.list" in mt or "manifests" in m:
+              sys.exit("expected a single image manifest, got an index: " + mt)
+          if len(m.get("layers", [])) != 1:
+              sys.exit("expected exactly one layer, got %d" % len(m.get("layers", [])))
+          print("manifest:", mt, "| layers: 1 |", m["layers"][0]["size"], "bytes")'
+          docker pull -q "$REF" >/dev/null
+          cid=$(docker create "$REF" none)
+          docker cp "$cid:/plugin.wasm" "$RUNNER_TEMP/pulled.wasm"
+          docker rm "$cid" >/dev/null
+          got=$(sha256sum "$RUNNER_TEMP/pulled.wasm" | cut -d' ' -f1)
+          [ "$got" = "$WANT" ] || { echo "::error::pulled plugin.wasm sha256 $got != built $WANT"; exit 1; }
+          echo "pulled plugin.wasm matches the build: $got"
+
+      - name: Summary
+        env:
+          LANG_: ${{ steps.meta.outputs.lang }}
+          NAME: ${{ steps.meta.outputs.name }}
+          IMAGE_NAME: ${{ steps.meta.outputs.image_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PUSHED: ${{ steps.meta.outputs.push }}
+          SHA: ${{ steps.build.outputs.sha256 }}
+        run: |
+          {
+            if [ "$PUSHED" = "true" ]; then
+              repo="${IMAGE_NAMESPACE}/${IMAGE_NAME}"
+              echo "### Published \`docker.io/${repo}:${VERSION}\` (${LANG_} plugin \`${NAME}\`)"
+              echo
+              echo "plugin.wasm sha256: \`${SHA}\`"
+              echo
+              echo "Gateways in mainland China may not reach Docker Hub. Once the mirror has copied it (about 10 minutes), reference:"
+              echo
+              echo '```yaml'
+              echo "url: oci://modelsphere.tencentcloudcr.com/${repo}:${VERSION}"
+              echo '```'
+            else
+              echo "### Dry run for ${LANG_} plugin \`${NAME}\` ${VERSION}: built and tested, nothing pushed"
+              echo
+              echo "plugin.wasm sha256: \`${SHA}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
