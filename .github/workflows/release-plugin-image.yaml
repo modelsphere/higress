@@ -8,6 +8,13 @@
 # publish what the commit says it is (the examples above match VERSION at the time of
 # writing). The image tag carries no v, like upstream's plugin images and the VERSION file.
 #
+# Release candidates: <version> may also be VERSION plus a pre-release suffix, so the
+# commit that will become 1.0.0 is tagged and published as 1.0.0-rc.1, 1.0.0-rc.2, ...
+# without editing VERSION; tagging that same commit v1.0.0 later publishes the release.
+#   plugin/go/ai-backend-router/v1.0.0-rc.1  (VERSION 1.0.0)  ->  ...:1.0.0-rc.1
+# The suffix is only accepted on top of a plain VERSION: with VERSION 1.0.0-rc.1 the tag
+# must be exactly v1.0.0-rc.1.
+#
 # A tag runs the workflow file as it exists in the TAGGED commit, so tag a commit that
 # already contains this file. Tags under plugin/ match none of the upstream workflows'
 # tag filters (v*.*.*, wasm-*-*-v*.*.*).
@@ -114,8 +121,14 @@ jobs:
           [ -f "$ROOT/Dockerfile" ] || { echo "::error::$ROOT/Dockerfile not found"; exit 1; }
           [ -f "$DIR/VERSION" ] || { echo "::error::$DIR/VERSION not found"; exit 1; }
           file_version=$(tr -d ' \t\r\n' < "$DIR/VERSION")
+          # Equal, or a pre-release of VERSION: <VERSION>-<suffix> (the tag pattern above
+          # already restricts the suffix). Not a pre-release of a pre-release.
           if [ -n "$TAG_VERSION" ] && [ "$TAG_VERSION" != "$file_version" ]; then
-            echo "::error::tag version $TAG_VERSION != $DIR/VERSION $file_version"; exit 1
+            case "$file_version" in *-*) base_ok=false ;; *) base_ok=true ;; esac
+            if [ "$base_ok" != true ] || [ "${TAG_VERSION%%-*}" != "$file_version" ]; then
+              echo "::error::tag version $TAG_VERSION is neither $DIR/VERSION ($file_version) nor a pre-release of it ($file_version-<suffix>)"; exit 1
+            fi
+            echo "pre-release $TAG_VERSION of VERSION $file_version"
           fi
           # The image name drops the language, as upstream's does. Some names exist in two
           # languages (model-router in Go and C++, ...), so both map to one repository.
