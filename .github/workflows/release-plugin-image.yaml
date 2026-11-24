@@ -2,11 +2,11 @@
 #
 # Trigger: push a tag  plugin/<lang>/<name>/v<version>
 #   plugin/go/ai-backend-router/v1.0.0  ->  docker.io/4pdosc/higress-plugin-ai-backend-router:1.0.0
-#   plugin/cpp/key_auth/v1.0.1          ->  docker.io/4pdosc/higress-plugin-key-auth:1.0.1
+#   plugin/cpp/key_auth/v2.0.1          ->  docker.io/4pdosc/higress-plugin-key-auth:2.0.1
 # <lang> is go | cpp | rust, <name> is the directory under plugins/wasm-<lang>/extensions/,
 # and <version> (without the v) must equal that directory's VERSION file, so a tag can only
-# publish what the commit says it is. The image tag carries no v, like upstream's plugin
-# images and the VERSION file.
+# publish what the commit says it is (the examples above match VERSION at the time of
+# writing). The image tag carries no v, like upstream's plugin images and the VERSION file.
 #
 # A tag runs the workflow file as it exists in the TAGGED commit, so tag a commit that
 # already contains this file. Tags under plugin/ match none of the upstream workflows'
@@ -19,10 +19,15 @@
 # upstream compiles it. Packaging is separate: FROM scratch + that single plugin.wasm,
 # which lets the pushed layer be checked byte-for-byte against the build.
 #
-# A published version is never overwritten: the run fails if <image>:<version> already
-# exists, so bump VERSION instead. No :latest tag either -- a WasmPlugin should name an
-# exact version (with the default imagePullPolicy a gateway may keep serving a cached copy
-# of a re-pushed tag).
+# A published version is never overwritten. If <image>:<version> already exists, the run
+# only proceeds when it holds exactly this build (a re-run after a failed verification);
+# anything else fails, so bump VERSION instead. No :latest tag either -- a WasmPlugin
+# should name an exact version (with the default imagePullPolicy a gateway may keep
+# serving a cached copy of a re-pushed tag).
+#
+# Tests run in the same builder image the Dockerfile uses, after the same steps the
+# Dockerfile runs before building (go mod tidy, prepare.sh / .prebuild), so they see the
+# toolchain and module state the shipped wasm is built from.
 # Provenance/SBOM attestations are off: they turn the push into a multi-manifest index,
 # and a single plain manifest is the shape that has been verified to load.
 #
@@ -113,17 +118,29 @@ jobs:
             echo "::error::tag version $TAG_VERSION != $DIR/VERSION $file_version"; exit 1
           fi
           # The image name drops the language, as upstream's does. Some names exist in two
-          # languages (model-router in Go and C++, ...), so both would land in one
-          # repository; the next step makes sure neither can overwrite the other's tags.
+          # languages (model-router in Go and C++, ...), so both map to one repository.
+          # Two plugins can only collide on a tag if they carry the same VERSION, so that
+          # case is refused outright: the decision does not depend on which of two
+          # concurrent runs pushes first. Different versions cannot overwrite each other.
           dashed="${NAME//_/-}"; underscored="${NAME//-/_}"
+          seen=" "
           for other in plugins/wasm-*/extensions/"$dashed" plugins/wasm-*/extensions/"$underscored"; do
             [ -d "$other" ] || continue
             [ "$other" = "$DIR" ] && continue
-            echo "::warning::$other maps to the same image name as $DIR"
+            case "$seen" in *" $other "*) continue ;; esac   # a name without - or _ matches twice
+            seen="$seen$other "
+            other_lang=${other#plugins/wasm-}; other_lang=${other_lang%%/*}
+            other_version=$(tr -d ' \t\r\n' < "$other/VERSION" 2>/dev/null || true)
+            case "$other_lang" in go|cpp|rust) ;; *) other_version="" ;; esac  # not publishable here
+            if [ -n "$other_version" ] && [ "$other_version" = "$file_version" ]; then
+              echo "::error::$other has the same VERSION $file_version and maps to the same image; bump one of them"; exit 1
+            fi
+            echo "::warning::$other maps to the same image name as $DIR (VERSION ${other_version:-none})"
           done
           echo "version=${TAG_VERSION:-$file_version}" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse to overwrite an existing image tag
+      - name: Is this version already published?
+        id: published
         if: steps.meta.outputs.push == 'true'
         env:
           IMAGE_NAME: ${{ steps.meta.outputs.image_name }}
@@ -132,28 +149,29 @@ jobs:
           set -euo pipefail
           # Docker Hub API: 200 = tag exists, 404 = tag or repository absent. Anything else
           # (rate limit, outage) cannot prove absence, so it fails the run rather than
-          # risk overwriting a published version.
+          # risk overwriting a published version. An existing tag is checked against the
+          # build further down instead of failing here, so a re-run can finish a release
+          # whose push succeeded but whose verification did not.
           url="https://hub.docker.com/v2/namespaces/${IMAGE_NAMESPACE}/repositories/${IMAGE_NAME}/tags/${VERSION}"
           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)
           case "$code" in
-            404) echo "${IMAGE_NAMESPACE}/${IMAGE_NAME}:${VERSION} not published yet" ;;
-            200) echo "::error::${IMAGE_NAMESPACE}/${IMAGE_NAME}:${VERSION} already exists; bump VERSION instead of overwriting"; exit 1 ;;
+            404) echo "${IMAGE_NAMESPACE}/${IMAGE_NAME}:${VERSION} not published yet"; echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            200) echo "${IMAGE_NAMESPACE}/${IMAGE_NAME}:${VERSION} exists; it must hold exactly this build"; echo "exists=true" >> "$GITHUB_OUTPUT" ;;
             *)   echo "::error::could not tell whether ${IMAGE_NAME}:${VERSION} exists (HTTP ${code:-none})"; exit 1 ;;
           esac
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Unit tests (Go, in the Dockerfile's builder image)
         if: steps.meta.outputs.lang == 'go'
-        with:
-          go-version-file: ${{ steps.meta.outputs.dir }}/go.mod
-          cache-dependency-path: ${{ steps.meta.outputs.dir }}/go.sum
-
-      - name: Unit tests (Go)
-        if: steps.meta.outputs.lang == 'go'
-        working-directory: ${{ steps.meta.outputs.dir }}
+        env:
+          ROOT: ${{ steps.meta.outputs.root }}
+          NAME: ${{ steps.meta.outputs.name }}
         run: |
           set -euo pipefail
-          if [ -f prepare.sh ]; then sh ./prepare.sh; fi
-          go test ./...
+          builder=$(sed -n 's/^ARG BUILDER=//p' "$ROOT/Dockerfile" | head -1)
+          [ -n "$builder" ] || { echo "::error::no ARG BUILDER in $ROOT/Dockerfile"; exit 1; }
+          # same steps the Dockerfile runs before go build: go mod tidy, then prepare.sh
+          docker run --rm -v "$GITHUB_WORKSPACE/$ROOT:/workspace" -w "/workspace/extensions/$NAME" \
+            "$builder" sh -c 'set -e; go mod tidy; if [ -f prepare.sh ]; then sh ./prepare.sh; fi; go version; go test ./...'
 
       - name: Unit tests (Rust, same toolchain image as the Dockerfile)
         if: steps.meta.outputs.lang == 'rust'
@@ -163,8 +181,12 @@ jobs:
         run: |
           set -euo pipefail
           rust_image=$(awk 'toupper($1)=="FROM" {print $2; exit}' "$ROOT/Dockerfile")
+          # CARGO_TARGET_DIR outside the bind mount: a target/ left under extensions/<name>
+          # is not covered by the root-level "target/" in .dockerignore and would be sent
+          # to the image build as context.
           docker run --rm -v "$GITHUB_WORKSPACE/$ROOT:/workspace" -w "/workspace/extensions/$NAME" \
-            "$rust_image" sh -c 'if [ -f .prebuild ]; then sh .prebuild; fi; cargo test --lib'
+            -e CARGO_TARGET_DIR=/tmp/cargo-target \
+            "$rust_image" sh -c 'set -e; if [ -f .prebuild ]; then sh .prebuild; fi; cargo test --lib'
 
       - name: Unit tests (C++)
         if: steps.meta.outputs.lang == 'cpp'
@@ -203,7 +225,8 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push image
-        if: steps.meta.outputs.push == 'true'
+        # an existing tag is never re-pushed; the next step checks it holds this build
+        if: steps.meta.outputs.push == 'true' && steps.published.outputs.exists == 'false'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ steps.build.outputs.context }}
@@ -217,6 +240,7 @@ jobs:
         env:
           REF: ${{ steps.meta.outputs.image }}:${{ steps.version.outputs.version }}
           WANT: ${{ steps.build.outputs.sha256 }}
+          EXISTED: ${{ steps.published.outputs.exists }}
         run: |
           set -euo pipefail
           raw=$(docker buildx imagetools inspect --raw "$REF")
@@ -234,8 +258,19 @@ jobs:
           docker cp "$cid:/plugin.wasm" "$RUNNER_TEMP/pulled.wasm"
           docker rm "$cid" >/dev/null
           got=$(sha256sum "$RUNNER_TEMP/pulled.wasm" | cut -d' ' -f1)
-          [ "$got" = "$WANT" ] || { echo "::error::pulled plugin.wasm sha256 $got != built $WANT"; exit 1; }
-          echo "pulled plugin.wasm matches the build: $got"
+          if [ "$got" != "$WANT" ]; then
+            if [ "$EXISTED" = "true" ]; then
+              echo "::error::$REF was already published with a different plugin.wasm ($got, this build $WANT); bump VERSION instead of overwriting"
+            else
+              echo "::error::pulled plugin.wasm sha256 $got != built $WANT"
+            fi
+            exit 1
+          fi
+          if [ "$EXISTED" = "true" ]; then
+            echo "$REF was already published and holds exactly this build (re-run); nothing pushed"
+          else
+            echo "pulled plugin.wasm matches the build: $got"
+          fi
 
       - name: Summary
         env:
@@ -244,12 +279,17 @@ jobs:
           IMAGE_NAME: ${{ steps.meta.outputs.image_name }}
           VERSION: ${{ steps.version.outputs.version }}
           PUSHED: ${{ steps.meta.outputs.push }}
+          EXISTED: ${{ steps.published.outputs.exists }}
           SHA: ${{ steps.build.outputs.sha256 }}
         run: |
           {
             if [ "$PUSHED" = "true" ]; then
               repo="${IMAGE_NAMESPACE}/${IMAGE_NAME}"
-              echo "### Published \`docker.io/${repo}:${VERSION}\` (${LANG_} plugin \`${NAME}\`)"
+              if [ "$EXISTED" = "true" ]; then
+                echo "### \`docker.io/${repo}:${VERSION}\` was already published with this exact build (re-run, nothing pushed)"
+              else
+                echo "### Published \`docker.io/${repo}:${VERSION}\` (${LANG_} plugin \`${NAME}\`)"
+              fi
               echo
               echo "plugin.wasm sha256: \`${SHA}\`"
               echo
