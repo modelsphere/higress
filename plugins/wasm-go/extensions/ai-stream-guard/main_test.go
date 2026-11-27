@@ -304,3 +304,36 @@ func TestTriggerOnFinishingChunkSendsNoSecondFinish(t *testing.T) {
 		require.Equal(t, 1, strings.Count(got, `"finish_reason":"`))
 	})
 }
+
+// One invalid rule must not take the guard off every other route: the plugin
+// still starts, the valid route is guarded, the invalid rule is skipped.
+func TestInvalidRuleIsIsolated(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(json.RawMessage(`{"_rules_":[
+			{"_match_route_":["iso-good"],"detectors":[{"type":"repetition","max_period":2,"min_repeated_chunks":6}]},
+			{"_match_route_":["iso-bad"],"detectors":[{"type":"repetition","max_period":4,"min_repeated_chunks":2}]}]}`))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		run := func(route string) string {
+			require.NoError(t, host.SetRouteName(route))
+			host.CallOnHttpRequestHeaders([][2]string{{":authority", "example.com"}, {":path", "/v1/chat/completions"}, {":method", "POST"}})
+			host.CallOnHttpResponseHeaders(sseHeaders)
+			out := body(t, host, repeatChunks(20, "a"), false)
+			host.CompleteHttp()
+			return out
+		}
+		require.Contains(t, run("iso-good"), `"finish_reason":"content_filter"`, "the valid route is still guarded")
+		require.Equal(t, repeatChunks(20, "a"), run("iso-bad"), "the invalid rule is skipped: its route passes through")
+	})
+}
+
+// Isolation has a floor: with no valid rule and no global config the plugin
+// start still fails (the README says so).
+func TestAllRulesInvalidStillFails(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(json.RawMessage(`{"_rules_":[{"_match_route_":["all-bad"],"detectors":[{"type":"repetition","max_period":0}]}]}`))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusFailed, status)
+	})
+}

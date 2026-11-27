@@ -501,3 +501,25 @@ func TestReplayWithoutBodyEvenWithUnreadableState(t *testing.T) {
 		require.Equal(t, uint32(502), local.StatusCode)
 	})
 }
+
+// One invalid rule must not take routing off every other route: the plugin
+// still starts, the valid route is routed, the invalid rule is skipped.
+func TestInvalidRuleIsIsolated(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		config := json.RawMessage(`{"_rules_":[
+			{"_match_route_":["iso-good"],"decisions":{"static":` + staticTable + `}},
+			{"_match_route_":["iso-bad"],"decisions":{"static":{"version":"v1","models":{}}},"retry":{"exclude":"nope"}}]}`)
+		host := newHost(t, config)
+		defer host.Reset()
+
+		require.NoError(t, host.SetRouteName("iso-good"))
+		pass(t, host, chatBody)
+		require.NotEmpty(t, backendOf(host), "the valid route is still routed")
+		host.CompleteHttp()
+
+		require.NoError(t, host.SetRouteName("iso-bad"))
+		action := host.CallOnHttpRequestHeaders(requestHeaders("/v1/chat/completions"))
+		require.Equal(t, types.ActionContinue, action, "the invalid rule is skipped: the plugin does not run on its route")
+		require.Empty(t, backendOf(host))
+	})
+}

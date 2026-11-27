@@ -40,6 +40,9 @@ func init() {
 	wrapper.SetCtx(
 		pluginName,
 		wrapper.ParseOverrideConfig(parseGlobalConfig, parseRuleConfig),
+		// An invalid rule is skipped (or keeps its last good copy) instead of
+		// failing the whole plugin and with it every route of a starting gateway.
+		wrapper.PrePluginStartOrReload[pluginConfig](isolateRules),
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onHttpStreamingResponseBody),
 	)
@@ -232,4 +235,9 @@ func incrementCounter(cfg pluginConfig, name string) {
 		cfg.counters[name] = c
 	}
 	c.Increment(1)
+}
+
+func isolateRules(ctx wrapper.PluginContext) error {
+	ctx.EnableRuleLevelConfigIsolation()
+	return nil
 }
