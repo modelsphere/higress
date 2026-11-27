@@ -72,7 +72,7 @@ The plugin only works together with the gateway configuration in [Gateway setup]
 | `backends[].enabled` | Boolean, default `true`. |
 | `backends[].target.cluster`, `backends[].maxConcurrency` | Reserved. `target.cluster` and any `maxConcurrency` > 0 are rejected. |
 
-Unknown fields are rejected (a top-level `extensions` object is allowed for the decision service's own data). An invalid table is rejected as a whole: as plugin config it fails the plugin start, as a pulled document it is ignored and the current table stays.
+Unknown fields are rejected (a top-level `extensions` object is allowed for the decision service's own data). An invalid table is rejected as a whole. In the global config it fails the plugin start. In a rule, that rule is skipped and logged, so it cannot take routing off other routes: its own routes keep the rule's last valid version in a gateway pod that had loaded it, or are not routed by this plugin in one that had not. If every rule is invalid and there is no global config, the plugin start still fails. A pulled document that is invalid is ignored and the current table stays.
 
 ### Decision source
 

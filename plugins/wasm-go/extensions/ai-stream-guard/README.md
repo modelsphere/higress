@@ -50,7 +50,7 @@ Plugin execution priority: `50`. Set both in the `WasmPlugin` resource; the plug
 | `min_repeated_chunks` | int | Optional | `512` | Fire when the repeating tail covers this many chunks, including the first occurrence of the group. Must be `>= 2 * max_period` |
 | `fields` | array of string | Optional | `["content", "reasoning"]` | Which text fields are watched: `content`, `reasoning`, and `reasoning_content` (alias of `reasoning`) |
 
-Unknown keys inside a `detectors[]` entry are rejected, so a typo cannot silently fall back to a default.
+Unknown keys inside a `detectors[]` entry are rejected, so a typo cannot silently fall back to a default. An invalid global config fails the plugin start. An invalid rule is skipped and logged, so it cannot take the guard off other routes: its own routes keep the rule's last valid version in a gateway pod that had loaded it, or run unguarded in one that had not. If every rule is invalid and there is no global config, the plugin start still fails.
 
 `cutoff` fields:
 

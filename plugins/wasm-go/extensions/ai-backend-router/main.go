@@ -65,6 +65,9 @@ func init() {
 	wrapper.SetCtx(
 		pluginName,
 		wrapper.ParseConfig(parseConfig),
+		// An invalid rule is skipped (or keeps its last good copy) instead of
+		// failing the whole plugin and with it every route of a starting gateway.
+		wrapper.PrePluginStartOrReload[Config](isolateRules),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
@@ -321,4 +324,9 @@ func (l *rateLimitedLog) errorf(reason, format string, args ...any) {
 		log.Errorf("[ai-backend-router] %d more %q errors suppressed in the last second", n, reason)
 	}
 	log.Errorf(format, args...)
+}
+
+func isolateRules(ctx wrapper.PluginContext) error {
+	ctx.EnableRuleLevelConfigIsolation()
+	return nil
 }
